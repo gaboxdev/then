@@ -5,7 +5,7 @@ export type Offer = { title: string; options: Option[]; at: number; suggested?: 
 
 declare module 'claude-code' {
   interface PluginState {
-    then: { offer: Offer | null; isOn: boolean; color: string | null; selected: number[] | null; theme: string | null; last: Offer | null }
+    then: { offer: Offer | null; isOn: boolean; color: string | null; selected: number[] | null; theme: string | null; last: Offer | null; waiting: string[] | null }
     // read only, to size the band when plan-progress draws its bars above it
     'plan-progress': { plans: PlanBar[]; isOpen: boolean }
   }

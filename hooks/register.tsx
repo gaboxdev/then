@@ -3,7 +3,7 @@ import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import type { Offer, PlanBar, Usage } from '../types'
 
-import { FREE, NUDGE, RULES, mailboxOf, offerBody, parseBlock, parsePick, pickContext, stripBlock } from './protocol'
+import { FREE, NUDGE, RULES_WITH_WAKEUPS, awaitedWork, canOutlive, mailboxOf, offerBody, parseBlock, parsePick, pickContext, stripBlock } from './protocol'
 
 export { mailboxOf, parseBlock, parsePick, stripBlock }
 
@@ -16,6 +16,8 @@ const color = atom({ plugin: 'then', key: 'color' } as const, null)
 const STORE_COLOR = 'color'
 // the last offer the person answered or set aside, for `/then otra vez`
 const lastOffer = atom({ plugin: 'then', key: 'last' } as const, null)
+// what a turn that stopped without options is paused on; the next turn, woken or typed, clears it
+const waiting = atom({ plugin: 'then', key: 'waiting' } as const, null)
 // plan-progress's bars, read to leave them room when they sit above the band
 const planBars = atom({ plugin: 'plan-progress', key: 'plans' } as const, [])
 const planOpen = atom({ plugin: 'plan-progress', key: 'isOpen' } as const, true)
@@ -33,7 +35,7 @@ type Words = {
   free: string; freeDetail: string; writing: string; writingDetail: string; option: string; off: string; on: string; command: string
   argumentHint: string; help: string; colors: Record<string, string>; soundOn: string; soundOff: string
   themes: Record<string, string>; themeSet: (name: string) => string; themeList: (current: string) => string
-  again: string; noLast: string
+  again: string; noLast: string; waiting: string; waitingHint: string; wakeup: string
   colorList: (current: string) => string; colorSet: (name: string) => string; colorBad: (arg: string) => string; colorReset: string
 }
 const WORDS_BY: Record<'es' | 'en', Words> = {
@@ -43,6 +45,7 @@ const WORDS_BY: Record<'es' | 'en', Words> = {
     badge: '★ sugerida', column: 'consumo ▾', usage: { none: 'nada', low: 'bajo', medium: 'medio', high: 'alto' },
     free: 'Otra cosa (libre)', freeDetail: 'ninguna de estas: escribe lo que quieras',
     writing: '✎ Escribiendo lo tuyo', writingDetail: 'escribe abajo y Enter; me llega tal cual', option: 'Opción',
+    waiting: 'Esperando', waitingHint: 'sigo solo al terminar; escribe si quieres otra cosa', wakeup: 'el próximo aviso programado',
     off: 'Then apagado. /then lo prende de nuevo.', on: 'Then prendido: al final de cada turno vas a ver 4 opciones para elegir con un número.',
     command: 'Prender o apagar las opciones al final de cada turno, o cambiar su color',
     argumentHint: '[otra vez] | color <nombre|#RRGGBB> | tema consumo|color | sonido on|off | on | off',
@@ -65,6 +68,7 @@ const WORDS_BY: Record<'es' | 'en', Words> = {
     badge: '★ suggested', column: 'usage ▾', usage: { none: 'none', low: 'low', medium: 'med', high: 'high' },
     free: 'Something else', freeDetail: 'none of these: type your own',
     writing: '✎ Writing your own', writingDetail: 'type below and Enter; sent as is', option: 'Option',
+    waiting: 'Waiting', waitingHint: 'I continue when it ends; type to do something else', wakeup: 'the next scheduled wake-up',
     off: 'Then is off. /then turns it back on.', on: 'Options on: each turn ends with 4 to pick by number.',
     command: 'Turn the options at the end of each turn on or off, or change their color',
     argumentHint: '[again] | color <name|#RRGGBB> | theme usage|color | sound on|off | on | off',
@@ -302,6 +306,8 @@ export const register: Register = (on, options) => {
   let hasAsked = false
   let hasNudged = false
   let isSoundOn = true
+  // the shells and monitors a turn gave options over: Claude judged them no wait, so a later stop does not either
+  const settled = new Set<string>()
 
   on('turn.start', async ($, e, next) => {
     if (!e.agentId) {
@@ -309,6 +315,7 @@ export const register: Register = (on, options) => {
       hasOffered = false
       hasAsked = false
       hasNudged = false
+      await update($, waiting, () => null)
     }
 
     return next(e)
@@ -365,7 +372,7 @@ export const register: Register = (on, options) => {
     const result = await next(e)
     if (!(await read($, isOn))) return result
 
-    return { sections: [...result.sections, { id: 'then:rules', text: RULES, scope: 'session' as const }] }
+    return { sections: [...result.sections, { id: 'then:rules', text: RULES_WITH_WAKEUPS, scope: 'session' as const }] }
   })
 
   // the main loop's reply is read once it is in: a <then> block becomes the band
@@ -420,16 +427,25 @@ export const register: Register = (on, options) => {
   // a turn that did work or answered something and ended without options is sent back once to offer them. That is
   // decided before the hooks beneath run: a turn sent back has not ended, so a settings hook (a notifier, a notch) must
   // not hear a stop that is not one and chime "done" twice. A hook beneath that blocks too is heard on the next stop.
-  // Work still running in the background does not excuse it: "waiting on the build" is a reply too, and skipping it
-  // left the person with no options and only the recap to read
+  // A turn paused on background work that will wake it is the exception: sending it back spends a whole model call to
+  // ask what the person nearly always answers with "wait". The band says what it is waiting for instead, so nobody is
+  // left with only the recap, and the options come with the turn the work wakes
   on('classic.Stop', async ($, e, next) => {
     if (!(await read($, isOn))) return next(e)
     const said = (e.last_assistant_message ?? '').trim()
-    const isQuiet = e.stop_hook_active || hasOffered || hasAsked || hasNudged || (workCalls === 0 && !said)
+    if (hasOffered) for (const t of e.background_tasks ?? []) if (canOutlive(t)) settled.add(t.id)
+    // a one-shot wake-up is a wait; a recurring one is always pending, and would excuse every turn of the session
+    const wakeup = (e.session_crons ?? []).some(c => !c.recurring) ? [T.wakeup] : []
+    const awaited = hasOffered || hasAsked ? [] : [...awaitedWork(e.background_tasks, settled), ...wakeup]
+    const isQuiet = e.stop_hook_active || hasOffered || hasAsked || hasNudged || awaited.length > 0 || (workCalls === 0 && !said)
     if (!isQuiet && !/[?？]\s*$/.test(said)) {
       hasNudged = true
 
       return { block: NUDGE }
+    }
+    if (awaited.length > 0) {
+      await clear($)
+      await update($, waiting, () => awaited)
     }
     // the offer is in the mailbox before the hooks beneath hear the stop, so an app they tell finds it there
     mailbox = mailboxOf(e.transcript_path, e.session_id) ?? mailbox
@@ -499,7 +515,27 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const o = await read($, offer)
     isBandShown = false
-    if (!o || e.props.hasSurvey || e.props.isWorking || !(await read($, isOn))) return next(e)
+    if (e.props.hasSurvey || e.props.isWorking || !(await read($, isOn))) return next(e)
+    // the colour `/then color` picked wins over /config; reading it here redraws the band when it changes
+    const chosen = await read($, color)
+    const painted = chosen ? accentOf(chosen) : picked
+    ACCENT = painted.accent
+    INK = painted.ink
+    if (!o) {
+      const work = await read($, waiting)
+      if (!work?.length) return next(e)
+      const under = await next(e)
+      const { Box: Row, Text: Label } = $.ui.resolve(e)
+      const strip = (
+        <Row key="then-esperando" flexDirection="row" gap={1} marginLeft={2}>
+          <Label color={INK} backgroundColor={accent()} weight="semibold">{` ${T.waiting} `}</Label>
+          <Label wrap="truncate">{work.join(' · ')}</Label>
+          <Label dimColor wrap="truncate">{`· ${T.waitingHint}`}</Label>
+        </Row>
+      )
+
+      return under && rowsOf(under) > 0 ? <Row flexDirection="column" gap={1}>{strip}{under}</Row> : strip
+    }
     isBandShown = true
     // what the host and the plugins after this one draw here stays, under the options; asked first, so the band
     // can size itself to the rows left. A band taller than its room scrolls, and the options under the fold are the
@@ -515,11 +551,6 @@ export const register: Register = (on, options) => {
     const showHeader = room >= 5
     const showFree = room >= 6
     const showColumn = room >= 7
-    // the colour `/then color` picked wins over /config; reading it here redraws the band when it changes
-    const chosen = await read($, color)
-    const painted = chosen ? accentOf(chosen) : picked
-    ACCENT = painted.accent
-    INK = painted.ink
     const els = $.ui.resolve(e)
     const { Box, Button, Text } = els
     // the detail scrolls under the pointer where the surface runs a Client of ours (terminal, desktop); elsewhere it

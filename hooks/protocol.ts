@@ -19,9 +19,37 @@ End every reply where you did or answered something with exactly ${COUNT} option
 </then>
 title: a concrete next action you can start right away, at most 6 words; detail: at most 12 words; both in the user's language. Put * after the one number you recommend. usage: none, low, med or high, what it would spend in tokens and time (none: nothing to run; low: a few reads or one command; med: several edits or a build; high: many files, agents or long runs). Most useful first. The person sees them as a numbered band above the prompt and picks by number, so never also list them in prose and never ask which one to do. Leave the block out only when you end on a question the person must answer in their own words, or you called AskUserQuestion.`
 
+// Claude Code wakes a session when its background work ends, and tells the mod what is still in flight. Codex does
+// neither, so its hook keeps the plain rule: there, a turn that stops is over
+export const RULES_WITH_WAKEUPS = `${RULES} The one other case: you are only waiting on a workflow, agent, background command or scheduled wake-up you started, which wakes you when it ends. Waiting is the default then: say in one line what you are waiting for, and never ask or offer whether to wait. A long-lived process such as a dev server is not a wait, so offer as usual.`
+
 
 // the cut drops half a character left at the edge (an emoji is two UTF-16 units)
 const str = (v: unknown, max: number) => (typeof v === 'string' ? v.replace(/\s+/g, ' ').trim().slice(0, max).replace(/[\uD800-\uDBFF]$/, '').trimEnd() : '')
+
+// the background work a stopped turn is paused on, named for the band. A shell that never exits (a dev server, a
+// watcher) wakes nobody, so a turn is not waiting on it. These match how such a command is run, not a word in it:
+// `2>/dev/null` and `cd server && npm run build` both end
+export type BackgroundWork = { id?: string; type?: string; description?: string; command?: string; name?: string }
+const LONG_LIVED = new RegExp(
+  [
+    String.raw`\b(npm|pnpm|yarn|bun)\s+(run\s+)?(dev|start|serve|preview|watch)\b`,
+    String.raw`\b(next|nuxt|vite|astro|remix|webpack|wrangler|expo|ng|storybook|hugo|netlify|vercel|deno\s+task)\s+(dev|serve|server|start|preview)\b`,
+    String.raw`\bvite\s*($|[;&|])`,
+    String.raw`--watch\b(?!=false)|\bcargo\s+watch\b|\btail\b[^|;&]*\s-[a-zA-Z]*[fF]\b`,
+    String.raw`\b(nodemon|http-server|live-server|uvicorn|gunicorn|ngrok|runserver)\b|\bhttp\.server\b|\bjupyter\s+(lab|notebook)\b|\bflask\s+run\b|\brails\s+s(erver)?\b`,
+    String.raw`\bdocker[ -]compose\s+up\b(?!.*\s-d\b)`,
+  ].join('|'),
+  'i',
+)
+// what can outlive every turn; a workflow or an agent always ends and wakes the session
+export const canOutlive = (t: BackgroundWork) => t.type === 'shell' || t.type === 'monitor'
+// `settled`: ids of work a turn already gave options over, which Claude has judged not to be a wait
+export const awaitedWork = (tasks: readonly BackgroundWork[] | undefined, settled: ReadonlySet<string> = new Set()): string[] =>
+  (tasks ?? [])
+    .filter(t => !(t.type === 'shell' && LONG_LIVED.test(t.command ?? '')) && !(t.id && settled.has(t.id)))
+    .map(t => str(t.name || t.description || t.command || t.type, 60))
+    .filter(Boolean)
 
 // ---------- reading a pick out of what the person typed ----------
 

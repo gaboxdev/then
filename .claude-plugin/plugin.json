@@ -1,6 +1,6 @@
 {
   "name": "then",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Then — a Claude mod. Every turn ends with 4 numbered next steps above the prompt (plus a free one): type the number and go. / Cada turno termina con 4 opciones: escribes el número y listo.",
   "author": {
     "name": "Gabriel Mendoza",

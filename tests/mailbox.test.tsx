@@ -1,5 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
+import { RULES, RULES_WITH_WAKEUPS, awaitedWork } from '../hooks/protocol'
 import { mailboxOf } from '../hooks/register'
 
 const OPTIONS = ['Probar en el navegador', 'Commitear lo propio', 'Escribir el arnés', 'Dejarlo así']
@@ -119,15 +120,102 @@ function bareSession(on: (name: never, fn: never) => void) {
   on('classic.Stop' as never, (() => ({})) as never)
 }
 
-test('work still running in the background does not excuse a turn from its options', { options: { language: 'español' } }, async ($, on) => {
+const WAITING_BAND = {
+  plugin: 'then',
+  component: 'AbovePrompt',
+  requestId: 'band',
+  surface: 'terminal',
+  props: { hasSurvey: false, isWorking: false, maxRows: 20, bodyColumns: 100 },
+} as const
+
+function drawsNothingBeneath(on: (name: never, fn: never) => void) {
+  on('ui.render' as never, (($: never, e: never) => {
+    const { Box } = ($ as { ui: { resolve: (e: never) => { Box: 'Box' } } }).ui.resolve(e)
+
+    return <Box />
+  }) as never)
+}
+
+test('a turn paused on a workflow or a shell is not sent back, and the band says what it waits for until the next turn', { options: { language: 'español' } }, async ($, on) => {
   bareSession(on as never)
+  drawsNothingBeneath(on as never)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   await $.turn.start({ turnId: 't1' } as never)
-  await $.tool.call({ tool: 'Bash', command: 'npm run typecheck' } as never)
+  await $.tool.call({ tool: 'Workflow' } as never)
   const stop = await $.classic.Stop({
     stop_hook_active: false,
     last_assistant_message: 'El typecheck sigue corriendo; te aviso cuando termine.',
-    background_tasks: [{ id: 'b1' }],
+    background_tasks: [
+      { id: 'w1', type: 'workflow', status: 'running', description: 'revisión', name: 'review-changes' },
+      { id: 'b1', type: 'shell', status: 'running', description: 'Correr el typecheck', command: 'npm run typecheck' },
+    ],
+  } as never)
+  expect(stop.block).toBeUndefined()
+  const ui = await $.ui.mount(WAITING_BAND as never)
+  expect((await ui.find({ type: 'Text', text: /review-changes · Correr el typecheck/ }))?.text).toContain('Correr el typecheck')
+
+  // the work wakes the session: a new turn takes the line down
+  await $.turn.start({ turnId: 't2' } as never)
+  expect(await ui.find({ type: 'Text', text: /review-changes/ })).toBeFalsy()
+})
+
+test('a shell counts as a wait by how it is run, not by a word in its command', () => {
+  const shell = (command: string) => awaitedWork([{ id: 's', type: 'shell', description: 'tarea', command }]).length
+  for (const ends of ['npm test 2>/dev/null', 'cd server && npm run build', 'npm run build', 'jest --watch=false', 'docker compose up --build -d', 'tail -n 5 log.txt']) expect(shell(ends)).toBe(1)
+  for (const never of ['npm run dev', 'pnpm dev:web', 'npm start', 'npx vite', 'npx next dev -p 3000', 'jest --watch', 'tail -n 5 -f log.txt', 'python -m http.server', 'uvicorn app:app', 'docker compose up --build']) expect(shell(never)).toBe(0)
+})
+
+test('only Claude Code gets the exception for waiting: Codex is not woken', () => {
+  expect(RULES).not.toContain('wakes you')
+  expect(RULES_WITH_WAKEUPS).toContain('wakes you')
+})
+
+test('a one-shot wake-up is a wait and a recurring one is not', { options: { language: 'español' } }, async ($, on) => {
+  bareSession(on as never)
+  drawsNothingBeneath(on as never)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ turnId: 't1' } as never)
+  await $.tool.call({ tool: 'ScheduleWakeup' } as never)
+  const stop = await $.classic.Stop({ stop_hook_active: false, last_assistant_message: 'Reviso en 20 minutos.', session_crons: [{ id: 'c1', schedule: '5 14 9 11 *', recurring: false, prompt: 'revisar' }] } as never)
+  expect(stop.block).toBeUndefined()
+  const ui = await $.ui.mount(WAITING_BAND as never)
+  expect((await ui.find({ type: 'Text', text: /próximo aviso programado/ }))?.text).toContain('aviso')
+
+  await $.turn.start({ turnId: 't2' } as never)
+  await $.tool.call({ tool: 'Read' } as never)
+  const recurring = await $.classic.Stop({ stop_hook_active: false, last_assistant_message: 'Leído.', session_crons: [{ id: 'c2', schedule: '*/5 * * * *', recurring: true, prompt: 'revisar' }] } as never)
+  expect(String(recurring.block)).toContain('<then>')
+})
+
+test('a shell a turn gave options over stops counting as a wait', { options: { language: 'español' } }, async ($, on) => {
+  bareSession(on as never)
+  on('turn.step', async function* (_, e) {
+    return { turnId: e.turnId, index: e.index, answer: REPLY, toolUses: [] }
+  })
+  on('clock.now', () => ({ value: 1000 }))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const tasks = [{ id: 'b9', type: 'shell', status: 'running', description: 'Levantar el sitio', command: './bin/levantar-sitio' }]
+  await $.turn.start({ turnId: 't1' } as never)
+  const stream = $.turn.step({ turnId: 't1', index: 0, model: 'm', messageCount: 1 } as never)
+  for await (const chunk of stream) void chunk
+  await stream.result
+  await $.classic.Stop({ stop_hook_active: false, last_assistant_message: 'Quedó arriba.', background_tasks: tasks } as never)
+
+  await $.turn.start({ turnId: 't2' } as never)
+  await $.tool.call({ tool: 'Read' } as never)
+  const later = await $.classic.Stop({ stop_hook_active: false, last_assistant_message: 'Leído.', background_tasks: tasks } as never)
+  expect(String(later.block)).toContain('<then>')
+})
+
+test('a dev server left running is no wait: the turn still owes its options',{ options: { language: 'español' } }, async ($, on) => {
+  bareSession(on as never)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ turnId: 't1' } as never)
+  await $.tool.call({ tool: 'Bash', command: 'npm run dev' } as never)
+  const stop = await $.classic.Stop({
+    stop_hook_active: false,
+    last_assistant_message: 'Listo, el servidor quedó arriba.',
+    background_tasks: [{ id: 'b1', type: 'shell', status: 'running', description: 'Levantar la app', command: 'npm run dev' }],
   } as never)
   expect(String(stop.block)).toContain('<then>')
 })
